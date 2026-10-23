@@ -4,9 +4,333 @@ export const systemSettingsJsContent = /* javascript */ `
 let isMergeMode = false;
 let stagingTags = [];
 
+const UI_THEMES = {
+    lavender: '经典默认',
+    shinyo: '新叶绿',
+    sakura: '哔哩粉',
+    tianyi: '天依蓝',
+    hatsune: '初音青',
+    sakuragi: '樱木红',
+    violet: '罗兰紫',
+    amber: 'LCL橘',
+};
+
+const UI_THEME_STORAGE_KEY = 'logvar_ui_theme';
+const UI_SCHEME_STORAGE_KEY = 'logvar_ui_color_scheme';
+
+function getStoredTheme() {
+    try {
+        const theme = String(localStorage.getItem(UI_THEME_STORAGE_KEY) || '').toLowerCase();
+        return Object.prototype.hasOwnProperty.call(UI_THEMES, theme) ? theme : null;
+    } catch (error) {
+        return null;
+    }
+}
+
+function getStoredColorScheme() {
+    try { return localStorage.getItem(UI_SCHEME_STORAGE_KEY) || null; } catch(e) { return null; }
+}
+
+function storeColorScheme(scheme) {
+    try { localStorage.setItem(UI_SCHEME_STORAGE_KEY, scheme); } catch(e) {}
+}
+
+function storeTheme(theme) {
+    try { localStorage.setItem(UI_THEME_STORAGE_KEY, theme); return true; } catch (error) { return false; }
+}
+
+function applyTheme(theme) {
+    const normalizedTheme = String(theme || '').toLowerCase();
+    const selectedTheme = Object.prototype.hasOwnProperty.call(UI_THEMES, normalizedTheme) ? normalizedTheme : 'lavender';
+    document.body.dataset.theme = selectedTheme;
+    document.documentElement.dataset.theme = selectedTheme;
+
+    document.querySelectorAll('[data-theme-option]').forEach(button => {
+        const isSelected = button.dataset.themeOption === selectedTheme;
+        button.setAttribute('aria-checked', String(isSelected));
+    });
+
+    const label = document.getElementById('theme-current-label');
+    if (label) label.textContent = 'UI_THEME · ' + UI_THEMES[selectedTheme];
+    if (typeof updateColorSchemeToggle === 'function') updateColorSchemeToggle();
+    return selectedTheme;
+}
+
+function setThemeButtonsDisabled(disabled) {
+    document.querySelectorAll('[data-theme-option]').forEach(button => {
+        button.disabled = disabled;
+    });
+}
+
+async function selectTheme(theme) {
+    const selectedTheme = applyTheme(theme);
+    const storedLocally = storeTheme(selectedTheme);
+    setThemeButtonsDisabled(true);
+
+    try {
+        const result = await saveImportedConfigValue('UI_THEME', selectedTheme);
+        if (!result || !result.success) {
+            throw new Error(result?.message || '保存失败');
+        }
+
+        updateLocalImportedConfig('UI_THEME', selectedTheme);
+        renderEnvList();
+        addLog('界面主题已保存为: ' + UI_THEMES[selectedTheme], 'success');
+    } catch (error) {
+        const localMessage = storedLocally ? '，已保存在当前浏览器' : '，仅在当前页面生效';
+        addLog('云端默认主题保存失败' + localMessage + ': ' + error.message, 'warn');
+        customAlert('主题已应用' + localMessage + '。云端默认主题保存失败: ' + error.message);
+    } finally {
+        setThemeButtonsDisabled(false);
+    }
+}
+
+const initialTheme = getStoredTheme() || document.body.dataset.theme;
+if (initialTheme) applyTheme(initialTheme);
+
+// 导出当前管理员可见的环境变量配置
+async function exportSystemConfig() {
+    try {
+        const response = await fetch(buildApiUrl('/api/config', true));
+        if (!response.ok) {
+            throw new Error('获取配置失败: HTTP ' + response.status);
+        }
+
+        const config = await response.json();
+        const values = config.originalEnvVars || {};
+        const maskedKeys = Object.entries(values)
+            .filter(([, value]) => typeof value === 'string' && /^\\*+$/.test(value))
+            .map(([key]) => key);
+
+        if (maskedKeys.length > 0) {
+            customAlert('当前页面没有权限读取完整配置，无法导出脱敏配置。请使用 ADMIN_TOKEN 访问系统配置。');
+            return;
+        }
+
+        const exportData = {
+            format: 'danmu-api-config',
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            values
+        };
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        const date = new Date().toISOString().slice(0, 10);
+        link.href = url;
+        link.download = 'danmu-api-config-' + date + '.json';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        addLog('配置文件导出成功，共 ' + Object.keys(values).length + ' 项', 'success');
+    } catch (error) {
+        addLog('配置文件导出失败: ' + error.message, 'error');
+        customAlert('配置文件导出失败: ' + error.message);
+    }
+}
+
+// 打开配置文件选择器
+function triggerConfigImport() {
+    const input = document.getElementById('config-import-file');
+    if (!input) return;
+    input.value = '';
+    input.click();
+}
+
+function readConfigFile(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('读取配置文件失败'));
+        reader.readAsText(file, 'utf-8');
+    });
+}
+
+function normalizeImportedConfig(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('配置文件必须是 JSON 对象');
+    }
+
+    const values = data.values || data.variables || data.env || data;
+    if (!values || typeof values !== 'object' || Array.isArray(values)) {
+        throw new Error('配置文件中没有找到有效的 values 配置项');
+    }
+
+    const reservedKeys = new Set(['format', 'version', 'exportedAt']);
+    const entries = [];
+    const invalidKeys = [];
+    const maskedKeys = [];
+
+    Object.entries(values).forEach(([rawKey, rawValue]) => {
+        const key = String(rawKey).trim();
+        if (reservedKeys.has(key)) return;
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+            invalidKeys.push(key || '(空键名)');
+            return;
+        }
+
+        if (rawValue !== null && typeof rawValue === 'object') {
+            invalidKeys.push(key + ' (值必须是文本、数字或布尔值)');
+            return;
+        }
+
+        let value = rawValue === null ? '' : String(rawValue);
+        if (/^\\*+$/.test(value)) {
+            maskedKeys.push(key);
+            return;
+        }
+        if (key === 'UI_THEME') {
+            value = value.trim().toLowerCase() || 'lavender';
+            if (!Object.prototype.hasOwnProperty.call(UI_THEMES, value)) {
+                invalidKeys.push(key + ' (不支持的主题: ' + value + ')');
+                return;
+            }
+        }
+        entries.push({ key, value });
+    });
+
+    if (invalidKeys.length > 0) {
+        throw new Error('配置文件包含无效项目: ' + invalidKeys.slice(0, 8).join('、'));
+    }
+    if (entries.length === 0) {
+        throw new Error(maskedKeys.length > 0 ? '配置文件中的值全部为脱敏值，无法导入' : '配置文件中没有可导入的配置');
+    }
+
+    // 令牌最后更新，避免导入过程中提前失去当前页面权限。
+    const importPriority = {
+        DEPLOY_PLATFROM_ACCOUNT: 10,
+        DEPLOY_PLATFROM_PROJECT: 11,
+        DEPLOY_PLATFROM_TOKEN: 12,
+        TOKEN: 20,
+        ADMIN_TOKEN: 30
+    };
+    entries.sort((a, b) => (importPriority[a.key] || 0) - (importPriority[b.key] || 0));
+
+    return { entries, maskedKeys };
+}
+
+async function saveImportedConfigValue(key, value) {
+    const request = (endpoint) => fetch(buildApiUrl(endpoint), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, value })
+    }).then(response => response.json());
+
+    let result = await request('/api/env/set');
+    if (!result.success) {
+        result = await request('/api/env/add');
+    }
+    return result;
+}
+
+function updateLocalImportedConfig(key, value) {
+    for (const items of Object.values(envVariables)) {
+        const item = items.find(entry => entry.key === key);
+        if (item) {
+            item.value = value;
+            return;
+        }
+    }
+
+    if (!envVariables.system) envVariables.system = [];
+    const isTheme = key === 'UI_THEME';
+    envVariables.system.push({
+        key,
+        value,
+        type: isTheme ? 'select' : 'text',
+        options: isTheme ? Object.keys(UI_THEMES) : [],
+        description: isTheme ? '管理界面主题' : '从配置文件导入的配置项'
+    });
+}
+
+// 读取并批量导入配置文件
+async function importSystemConfigFile(file) {
+    if (!file) return;
+
+    try {
+        const data = JSON.parse(await readConfigFile(file));
+        const { entries, maskedKeys } = normalizeImportedConfig(data);
+        const confirmed = await customConfirm(
+            '即将覆盖 ' + entries.length + ' 项环境变量配置，导入过程可能需要一些时间。是否继续？',
+            '确认导入配置'
+        );
+        if (!confirmed) return;
+
+        showLoading('正在导入配置...', '准备导入 ' + entries.length + ' 项');
+        const failed = [];
+
+        for (let i = 0; i < entries.length; i++) {
+            const { key, value } = entries[i];
+            updateLoadingText('正在导入配置...', (i + 1) + '/' + entries.length + '  ' + key);
+            try {
+                const result = await saveImportedConfigValue(key, value);
+                if (!result || !result.success) {
+                    failed.push(key + ': ' + (result?.message || '保存失败'));
+                } else {
+                    updateLocalImportedConfig(key, value);
+                    if (key === 'UI_THEME') {
+                        applyTheme(value);
+                        storeTheme(value);
+                    }
+                }
+            } catch (error) {
+                failed.push(key + ': ' + error.message);
+            }
+        }
+
+        hideLoading();
+        renderEnvList();
+        renderPreview();
+
+        if (failed.length > 0) {
+            addLog('配置导入部分失败: ' + failed.join('；'), 'error');
+            customAlert('配置导入完成，但有 ' + failed.length + ' 项失败：\\n' + failed.slice(0, 8).join('\\n'));
+            return;
+        }
+
+        let successMessage;
+        if (maskedKeys.length > 0) {
+            addLog('配置导入完成，跳过 ' + maskedKeys.length + ' 项脱敏配置', 'warn');
+            successMessage = '配置导入成功，已跳过 ' + maskedKeys.length + ' 项脱敏值配置。';
+        } else {
+            addLog('配置导入成功，共 ' + entries.length + ' 项', 'success');
+            successMessage = '配置导入成功，共导入 ' + entries.length + ' 项配置。';
+        }
+
+        if (entries.some(entry => entry.key === 'TOKEN' || entry.key === 'ADMIN_TOKEN')) {
+            successMessage += '\\n访问令牌已更新，请使用新 TOKEN 或 ADMIN_TOKEN 地址重新打开管理页面。';
+        }
+        customAlert(successMessage);
+    } catch (error) {
+        hideLoading();
+        addLog('配置文件导入失败: ' + error.message, 'error');
+        customAlert('配置文件导入失败: ' + error.message);
+    }
+}
+
 // 显示清理缓存确认模态框
 function showClearCacheModal() {
+    selectAllCacheItems(true); // 每次打开恢复默认全选
     document.getElementById('clear-cache-modal').classList.add('active');
+}
+
+// 批量勾选或取消勾选所有缓存项，并同步已选数量
+function selectAllCacheItems(checked) {
+    document.querySelectorAll('#clear-cache-modal input[name="cacheItem"]').forEach(cb => {
+        cb.checked = checked;
+    });
+    updateCacheClearCount();
+}
+
+// 刷新清理缓存弹窗中已勾选项的数量统计
+function updateCacheClearCount() {
+    const all = document.querySelectorAll('#clear-cache-modal input[name="cacheItem"]');
+    const checked = document.querySelectorAll('#clear-cache-modal input[name="cacheItem"]:checked');
+    const countEl = document.getElementById('cache-clear-count');
+    if (countEl) {
+        countEl.textContent = '已选 ' + checked.length + ' / ' + all.length;
+    }
 }
 
 // 隐藏清理缓存确认模态框
@@ -16,6 +340,14 @@ function hideClearCacheModal() {
 
 // 确认清理缓存
 async function confirmClearCache() {
+    // 收集勾选的缓存项
+    const checkboxes = document.querySelectorAll('#clear-cache-modal input[name="cacheItem"]:checked');
+    const items = Array.from(checkboxes).map(cb => cb.value);
+    if (items.length === 0) {
+        customAlert('请至少选择一项要清理的缓存');
+        return;
+    }
+
     // 检查部署平台配置
     const configCheck = await checkDeployPlatformConfig();
     if (!configCheck.success) {
@@ -29,12 +361,13 @@ async function confirmClearCache() {
     addLog('开始清理缓存', 'info');
 
     try {
-        // 调用真实的清理缓存API
+        // 调用真实的清理缓存API，附带勾选的待清理项
         const response = await fetch(buildApiUrl('/api/cache/clear', true), { // 使用admin token
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
-            }
+            },
+            body: JSON.stringify({ items })
         });
 
         const result = await response.json();
@@ -43,6 +376,10 @@ async function confirmClearCache() {
             updateLoadingText('清理完成', '缓存已成功清除');
             addLog('缓存清理完成', 'success');
             addLog('✅ 缓存清理成功！已清理: ' + JSON.stringify(result.clearedItems), 'success');
+            if (result.restartRequired) {
+                addLog(result.message, 'warn');
+                customAlert(result.message);
+            }
         } else {
             updateLoadingText('清理失败', '请查看日志了解详情');
             addLog('缓存清理失败: ' + result.message, 'error');
@@ -345,8 +682,8 @@ async function checkDeployPlatformConfig() {
             missingVars.push('DEPLOY_PLATFROM_TOKEN');
         }
         
-        // 对于netlify和cloudflare部署平台，还需要检查DEPLOY_PLATFROM_ACCOUNT
-        if (deployPlatform.toLowerCase() === 'netlify' || deployPlatform.toLowerCase() === 'cloudflare') {
+        // 对于需要账号ID的部署平台，还需要检查DEPLOY_PLATFROM_ACCOUNT
+        if (['netlify', 'cloudflare', 'huggingface'].includes(deployPlatform.toLowerCase())) {
             if (!deployPlatformAccount || deployPlatformAccount.trim() === '') {
                 missingVars.push('DEPLOY_PLATFROM_ACCOUNT');
             }
@@ -383,12 +720,21 @@ function checkAndHandleAdminToken() {
     }
 }
 
+// 获取配置项类型的显示标签
+function getEnvTypeLabel(type) {
+    return type === 'boolean' ? '布尔' :
+           type === 'number' ? '数字' :
+           type === 'select' ? '单选' :
+           type === 'map' ? '映射' :
+           type === 'multi-select' ? '多选' : '文本';
+}
+
 // 渲染值输入控件
 function renderValueInput(item) {
     const container = document.getElementById('value-input-container');
-    const type = item ? item.type : document.getElementById('value-type').value;
+    const type = item ? item.type : editingType;
     const value = item ? item.value : '';
-    const currentKey = item ? item.key : document.getElementById('env-key').value;
+    const currentKey = item ? item.key : editingKeyName;
 
     if (type === 'boolean') {
         // 布尔开关
@@ -425,8 +771,8 @@ function renderValueInput(item) {
             <label>值 (\${min}-\${max})</label>
             <div class="number-picker">
                 <div class="number-controls">
-                    <button type="button" class="number-btn" onclick="adjustNumber(1)">▲</button>
-                    <button type="button" class="number-btn" onclick="adjustNumber(-1)">▼</button>
+                    <button type="button" class="number-btn" onclick="adjustNumber(1)">\${uiIcon('chevron-up')}</button>
+                    <button type="button" class="number-btn" onclick="adjustNumber(-1)">\${uiIcon('chevron-down')}</button>
                 </div>
                 <div class="number-display" id="num-value">\${currentValue}</div>
             </div>
@@ -465,7 +811,10 @@ function renderValueInput(item) {
         const options = item && item.options ? item.options : ['option1', 'option2', 'option3', 'option4'];
         // 确保value是字符串类型后再进行split操作
         const stringValue = typeof value === 'string' ? value : String(value || '');
-        const selectedValues = stringValue ? stringValue.split(',').map(v => v.trim()).filter(v => v) : [];
+        // 排序配置中重复项没有语义，渲染时顺便清理历史脏数据。
+        const selectedValues = stringValue
+            ? [...new Set(stringValue.split(',').map(v => v.trim()).filter(v => v))]
+            : [];
         
         // 检查是否为 SOURCE_ORDER，如果是则不显示合并模式
         const shouldShowMergeMode = currentKey === 'MERGE_SOURCE_PAIRS' || currentKey === 'PLATFORM_ORDER';
@@ -498,15 +847,15 @@ function renderValueInput(item) {
                 \${shouldShowMergeMode ? \`
                 <div class="merge-mode-controls">
                     <div class="merge-mode-btn" id="merge-mode-toggle" onclick="toggleMergeMode()">
-                        <span class="icon">🔗️</span> 开启合并模式
+                        \${uiIcon('link')} 合并模式
                     </div>
                     <div class="form-help" style="margin: 0; margin-left: 10px;">
-                        开启后点击下方选项将添加到暂存区,组合后点击 √ 确认
+                        点击开启/关闭，在暂存区组合后添加。
                     </div>
                 </div>
 
                 <div class="staging-area" id="staging-area">
-                    <button type="button" class="confirm-merge-btn" onclick="confirmMergeGroup()" title="确认添加该组">✓</button>
+                    <button type="button" class="confirm-merge-btn" onclick="confirmMergeGroup()" title="确认添加该组">\${uiIcon('check')}</button>
                 </div>
                 \` : ''}
 
@@ -522,6 +871,13 @@ function renderValueInput(item) {
                     }).join('')}
                 </div>
             </div>
+
+            \${currentKey === 'MERGE_SOURCE_PAIRS' ? \`
+            <div style="margin-top: 8px; display: flex; justify-content: flex-end;">
+                \${renderRecentDataButton()}
+            </div>
+            \${renderRecentDataPanel()}
+            \` : ''}
         \`;
 
         // 设置拖动事件
@@ -542,6 +898,8 @@ function renderValueInput(item) {
 
         container.innerHTML = \`
             <label>映射配置</label>
+            <textarea id="map-bulk-value" rows="6" placeholder="原值->映射值;原值2->映射值2">\${escapeHtml(value || '')}</textarea>
+            <button type="button" class="btn btn-secondary" onclick="parseBulkMapItems()">\${uiIcon('refresh-cw')} 解析并更新列表</button>
             <div class="map-container" id="map-container">
                 \${mapItems.map((item, index) => \`
                     <div class="map-item" data-index="\${index}">
@@ -558,17 +916,27 @@ function renderValueInput(item) {
                     <button type="button" class="btn btn-danger map-remove-btn" onclick="removeMapItem(this)">删除</button>
                 </div>
             </div>
-            <button type="button" class="btn btn-primary" onclick="addMapItem()">添加映射项</button>
+            <div style="margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                <button type="button" class="btn btn-primary" onclick="addMapItem()">\${uiIcon('plus')} 添加映射项</button>
+                \${renderRecentDataButton('btn btn-primary')}
+            </div>
+            \${renderRecentDataPanel()}
         \`;
+
+        bindMapInputSync();
 
     } else {
         // 文本输入
-        const currentKey = document.getElementById('env-key') ? document.getElementById('env-key').value : '';
+        const currentKey = editingKeyName;
         const isBilibiliCookie = currentKey === 'BILIBILI_COOKIE';
         const isAiApiKey = currentKey === 'AI_API_KEY';
+        const isDandanplayPassword = currentKey === 'DANDANPLAY_PASSWORD';
         const isColorPool = currentKey === 'COLOR_POOL';
         const isDanmuOffset = currentKey === 'DANMU_OFFSET';
+		const isCustomMergeRules = currentKey === 'CUSTOM_MERGE_RULES';
         const offsetSources = item && item.sources ? item.sources : [];
+        const isTitleFilter = currentKey === 'ANIME_TITLE_FILTER' || currentKey === 'EPISODE_TITLE_FILTER' || currentKey === 'TITLE_NOISE_FILTER';
+        const recentDataBlock = isTitleFilter ? \`<div style="margin-top: 8px; display: flex; justify-content: flex-end;">\${renderRecentDataButton()}</div>\${renderRecentDataPanel()}\` : '';
 
         if (isColorPool) {
             // 自定义颜色池专用编辑界面
@@ -612,12 +980,14 @@ function renderValueInput(item) {
             const rows = value && value.length > 50 ? Math.min(Math.max(Math.ceil(value.length / 50), 3), 10) : 3;
             container.innerHTML = \`
                 <label>变量值</label>
-                <textarea id="text-value" placeholder="格式：剧名:秒 或 剧名/S01:秒 或 剧名@来源:秒" rows="\${rows}" class="text-monospace">\${value}</textarea>
-                <div style="margin-top: 8px;">
+                <textarea id="text-value" placeholder="格式：剧名:秒 或 剧名/S01:秒 或 剧名@来源:秒 或 剧名/S01/E01@来源%:秒" rows="\${rows}" class="text-monospace">\${value}</textarea>
+                <div style="margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
                     <button type="button" class="btn btn-primary btn-sm" id="offset-rule-toggle" onclick="toggleOffsetRulePanel()">
-                        添加规则
+                        \${uiIcon('plus')} 添加规则
                     </button>
+                    \${renderRecentDataButton()}
                 </div>
+                \${renderRecentDataPanel('点击下方按钮可快捷填入规则表单：')}
                 <div id="offset-rule-panel" class="offset-rule-panel">
                     <div class="form-help" style="margin: 0 0 8px 0;">季和集不填则对所有季/集生效</div>
                     <div class="offset-form-row">
@@ -637,6 +1007,12 @@ function renderValueInput(item) {
                             <label class="offset-label">偏移秒 *</label>
                             <input type="number" id="offset-seconds" class="offset-input" placeholder="90">
                         </div>
+                    </div>
+                    <div style="margin-bottom: 10px; display: flex; align-items: center; width: 100%;">
+                        <label class="offset-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0;">
+                            启用百分比模式（按视频时长缩放全部弹幕时间）
+                            <input type="checkbox" id="offset-use-percent" class="app-checkbox">
+                        </label>
                     </div>
                     \${offsetSources.length > 0 ? \`
                     <div style="margin-bottom: 10px;">
@@ -665,12 +1041,31 @@ function renderValueInput(item) {
                     <div class="form-help">支持 OpenAI 兼容的 API，需配合 AI_BASE_URL 和 AI_MODEL 配置使用</div>
 
                     <div class="ai-apikey-status" id="ai-apikey-status">
-                        <span class="ai-status-icon">🔍</span>
+                        <span class="ai-status-icon">\${uiIcon('search')}</span>
                         <span class="ai-status-text">点击下方按钮测试连通性</span>
                     </div>
                     <div class="ai-apikey-actions" style="margin-bottom: 15px;">
                         <button type="button" class="btn btn-primary btn-sm" id="ai-verify-btn" onclick="verifyAiConnection()">
-                            🧪 测试连通性
+                            \${uiIcon('flask')} 测试连通性
+                        </button>
+                    </div>
+                </div>
+            \`;
+        } else if (isDandanplayPassword) {
+            // 弹弹play密码专用编辑界面
+            container.innerHTML = \`
+                <div class="dandanplay-editor">
+                    <label>弹弹play密码</label>
+                    <textarea class="form-group" id="text-value" placeholder="请输入弹弹play密码" rows="3">\${value}</textarea>
+                    <div class="form-help">账号在 DANDANPLAY_ACCOUNT 中配置，两者同时填写后 dandan 源经 NipaPlay 中转弹弹play服务端获取弹幕</div>
+
+                    <div class="dandanplay-status" id="dandanplay-status">
+                        <span class="dandanplay-status-icon">\${uiIcon('search')}</span>
+                        <span class="dandanplay-status-text">点击下方按钮测试连通性</span>
+                    </div>
+                    <div class="dandanplay-actions" style="margin-bottom: 15px;">
+                        <button type="button" class="btn btn-primary btn-sm" id="dandanplay-verify-btn" onclick="verifyDandanplayConnection()">
+                            \${uiIcon('flask')} 测试连通性
                         </button>
                     </div>
                 </div>
@@ -681,13 +1076,13 @@ function renderValueInput(item) {
             container.innerHTML = \`
                 <div class="bili-cookie-editor">
                     <div class="bili-cookie-status" id="bili-cookie-status">
-                        <span class="bili-status-icon">🔍</span>
+                        <span class="bili-status-icon">\${uiIcon('search')}</span>
                         <span class="bili-status-text">检测中...</span>
                     </div>
                     
                     <div class="bili-cookie-actions">
                         <button type="button" class="btn btn-primary btn-sm" onclick="startBilibiliQRLogin()">
-                            📱 扫码登录
+                            \${uiIcon('qr-code')} 扫码登录
                         </button>
                     </div>
                     
@@ -712,16 +1107,69 @@ function renderValueInput(item) {
                     });
                 }
             }, 120);
+        } else if (isCustomMergeRules) {
+            // CUSTOM_MERGE_RULES 专用编辑界面
+            const rows = value && value.length > 50 ? Math.min(Math.max(Math.ceil(value.length / 50), 3), 10) : 3;
+            container.innerHTML = \`
+                <label>变量值</label>
+                <textarea id="text-value" placeholder="格式：副源 -> 主源 | 路由规则 或 副源 × 主源" rows="\${rows}" class="text-monospace">\${value || ''}</textarea>
+                <div style="margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                    <button type="button" class="btn btn-primary btn-sm" id="merge-rule-toggle" onclick="toggleMergeRulePanel()">
+                        \${uiIcon('plus')} 添加规则
+                    </button>
+                    \${renderRecentDataButton()}
+                </div>
+                \${renderRecentDataPanel('点击下方按钮可快捷填入规则表单：')}
+                <div id="merge-rule-panel" class="offset-rule-panel">
+                    <div class="offset-form-row">
+                        <div style="flex: 1; min-width: 120px;">
+                            <label class="offset-label">副源实体（副源剧名@源）</label>
+                            <input type="text" id="merge-sec-entity" class="offset-input" placeholder="例: 我推的孩子/S01@bahamut" onfocus="setMergeFocus('sec')">
+                        </div>
+                        <div style="width: 80px; display: flex; flex-direction: column; align-items: center; justify-content: flex-end;">
+                            <label class="offset-label" style="text-align: center; display: block;">关系：<span id="merge-action-hint" style="font-weight: normal; color: var(--theme-muted);">合并</span></label>
+                            <select id="merge-action" class="offset-input" onchange="onMergeActionChange()" style="cursor: pointer; text-align: center; font-weight: bold; font-size: 15px;">
+                                <option value="->">-&gt;</option>
+                                <option value="×">×</option>
+                            </select>
+                        </div>
+                        <div style="flex: 1; min-width: 120px;">
+                            <label class="offset-label">主源实体（主源剧名@源）</label>
+                            <input type="text" id="merge-prim-entity" class="offset-input" placeholder="例: 我推的孩子/S03@dandan" onfocus="setMergeFocus('prim')">
+                        </div>
+                    </div>
+                    <div class="offset-form-row" id="merge-route-row">
+                        <div style="flex: 1;">
+                            <label class="offset-label">集数路由规则 (选填，可多组。例如: E01>E01,E25~E35>E25~E35)</label>
+                            <input type="text" id="merge-route-rule" class="offset-input" placeholder="留空则交由系统自动计算偏移">
+                        </div>
+                    </div>
+                    <div style="margin-bottom: 10px;">
+                        <label class="offset-label">快速追加来源至当前聚焦的输入框 (没有 @ 则追加 @xxx，已存在 @ 则追加 &xxx 合并写法)</label>
+                        <div class="offset-sources">
+                            \${offsetSources.map(src => \`
+                                <div class="offset-source-tag" onclick="appendSourceToMerge('\${src}')">\${src}</div>
+                            \`).join('')}
+                        </div>
+                    </div>
+                    <div class="offset-actions">
+                        <button type="button" class="btn btn-sm" onclick="toggleMergeRulePanel()">取消</button>
+                        <button type="button" class="btn btn-primary btn-sm" onclick="appendMergeRule()">确认添加</button>
+                    </div>
+                </div>
+            \`;
         } else if (value && value.length > 50) {
             const rows = Math.min(Math.max(Math.ceil(value.length / 50), 3), 10);
             container.innerHTML = \`
                 <label>变量值 *</label>
                 <textarea id="text-value" placeholder="例如: localhost" rows="\${rows}" class="text-monospace">\${value}</textarea>
+                \${recentDataBlock}
             \`;
         } else {
             container.innerHTML = \`
                 <label>变量值 *</label>
                 <input type="text" id="text-value" placeholder="例如: localhost" value="\${value}" required>
+                \${recentDataBlock}
             \`; 
         }
     }
@@ -986,7 +1434,7 @@ function toggleOffsetRulePanel() {
         const isHidden = getComputedStyle(panel).display === 'none';
         panel.style.display = isHidden ? 'block' : 'none';
         const btn = document.getElementById('offset-rule-toggle');
-        if (btn) btn.textContent = isHidden ? '收起' : '添加规则';
+        if (btn) btn.innerHTML = isHidden ? uiIcon('chevron-up') + ' 收起' : uiIcon('plus') + ' 添加规则';
     }
 }
 
@@ -1001,6 +1449,7 @@ function appendOffsetRule() {
     const season = document.getElementById('offset-season').value.trim();
     const episode = document.getElementById('offset-episode').value.trim();
     const seconds = document.getElementById('offset-seconds').value.trim();
+    const usePercent = !!document.getElementById('offset-use-percent')?.checked;
 
     if (!anime) {
         customAlert('请输入剧名');
@@ -1032,6 +1481,10 @@ function appendOffsetRule() {
         }
     }
 
+    if (usePercent) {
+        path += '%';
+    }
+
     const rule = path + ':' + seconds;
     const textarea = document.getElementById('text-value');
     const current = textarea.value.trim();
@@ -1041,6 +1494,10 @@ function appendOffsetRule() {
     document.getElementById('offset-season').value = '';
     document.getElementById('offset-episode').value = '';
     document.getElementById('offset-seconds').value = '';
+    const usePercentEl = document.getElementById('offset-use-percent');
+    if (usePercentEl) {
+        usePercentEl.checked = false;
+    }
     if (sourcesEl) {
         sourcesEl.querySelectorAll('.offset-source-tag.selected').forEach(el => {
             el.classList.remove('selected');
@@ -1049,7 +1506,90 @@ function appendOffsetRule() {
     toggleOffsetRulePanel();
 }
 
-// 调整数字
+// CUSTOM_MERGE_RULES 快速配置 - 焦点状态记录
+let currentMergeFocus = 'sec';
+
+function setMergeFocus(type) {
+    currentMergeFocus = type;
+}
+
+// CUSTOM_MERGE_RULES 快速配置 - 快捷追加来源
+function appendSourceToMerge(source) {
+    const inputId = currentMergeFocus === 'sec' ? 'merge-sec-entity' : 'merge-prim-entity';
+    const inputEl = document.getElementById(inputId);
+    if (!inputEl) return;
+
+    let val = inputEl.value.trim();
+    if (val.includes('@')) {
+        val += '&' + source;
+    } else {
+        val += '@' + source;
+    }
+    inputEl.value = val;
+    inputEl.focus(); // 保持焦点，方便用户连续点击多个来源
+}
+
+// CUSTOM_MERGE_RULES 快速配置 - 切换规则面板
+function toggleMergeRulePanel() {
+    const panel = document.getElementById('merge-rule-panel');
+    if (panel) {
+        const isHidden = getComputedStyle(panel).display === 'none';
+        panel.style.display = isHidden ? 'block' : 'none';
+        const btn = document.getElementById('merge-rule-toggle');
+        if (btn) btn.innerHTML = isHidden ? uiIcon('chevron-up') + ' 收起' : uiIcon('plus') + ' 添加规则';
+    }
+}
+
+// CUSTOM_MERGE_RULES 快速配置 - 切换操作符联动
+function onMergeActionChange() {
+    const action = document.getElementById('merge-action').value;
+    const routeRow = document.getElementById('merge-route-row');
+    const hint = document.getElementById('merge-action-hint');
+
+    if (action === '×') {
+        if (routeRow) routeRow.style.display = 'none';
+        if (hint) hint.textContent = '阻断';
+    } else {
+        if (routeRow) routeRow.style.display = 'flex';
+        if (hint) hint.textContent = '合并';
+    }
+}
+
+// CUSTOM_MERGE_RULES 快速配置 - 确认添加规则
+function appendMergeRule() {
+    const secEntity = document.getElementById('merge-sec-entity').value.trim();
+    const action = document.getElementById('merge-action').value;
+    const primEntity = document.getElementById('merge-prim-entity').value.trim();
+    const routeRule = document.getElementById('merge-route-rule').value.trim();
+
+    if (!secEntity || !primEntity) {
+        customAlert('副源实体和主源实体不能为空');
+        return;
+    }
+
+    let rule = secEntity + ' ' + action + ' ' + primEntity;
+    if (action === '->' && routeRule) {
+        rule += ' | ' + routeRule;
+    }
+
+    const textarea = document.getElementById('text-value');
+    const current = textarea.value.trim();
+
+    if (current && !current.endsWith(';')) {
+        textarea.value = current + ';' + rule;
+    } else {
+        textarea.value = current ? current + rule : rule;
+    }
+
+    // 清空表单
+    document.getElementById('merge-sec-entity').value = '';
+    document.getElementById('merge-prim-entity').value = '';
+    document.getElementById('merge-route-rule').value = '';
+
+    toggleMergeRulePanel();
+}
+
+// 递增/递减数字输入
 function adjustNumber(delta) {
     const display = document.getElementById('num-value');
     const slider = document.getElementById('num-slider');
@@ -1086,19 +1626,34 @@ function updateTagOptions() {
 }
 
 // 统一的状态检查函数
+function getSelectedTagElements() {
+    const container = document.getElementById('selected-tags');
+    if (!container) return [];
+
+    return Array.from(container.children).filter(element =>
+        element.classList.contains('selected-tag') && !element.dataset.dragGhost
+    );
+}
+
 function updateTagStates() {
     // 确保 DOM 元素存在，防止在渲染过程中被调用出错
-    const keyInput = document.getElementById('env-key');
-    if (!keyInput) return;
+    // 确保当前编辑配置存在
+    if (!editingKeyName) return;
 
-    const currentKey = keyInput.value;
+    const currentKey = editingKeyName;
     const isMergeSourcePairs = currentKey === 'MERGE_SOURCE_PAIRS';
-
+    const preventDuplicateSources = currentKey === 'SOURCE_ORDER' || currentKey === 'PLATFORM_ORDER';
     // 1. 获取当前暂存区中的Token (防止同组内重复)
     const stagingTokens = new Set(stagingTags);
     
     // 2. 获取已确认的 Selected Tags (仅在非合并模式下需要检查)
-    const selectedTagElements = Array.from(document.querySelectorAll('.selected-tag'));
+    const selectedTagElements = getSelectedTagElements();
+    // PLATFORM_ORDER 的已选项可能是 dandan&animeko，需要将组合拆开后再判断源是否已添加。
+    const selectedSourceTokens = new Set(
+        selectedTagElements.flatMap(element =>
+            String(element.dataset.value || '').split('&').map(value => value.trim()).filter(Boolean)
+        )
+    );
 
     // 3. 更新所有可选项的状态
     const availableTags = document.querySelectorAll('.available-tag');
@@ -1108,15 +1663,16 @@ function updateTagStates() {
 
         if (isMergeMode) {
             // [合并模式逻辑]
-            // 只要不在当前的暂存区中，就可以选（允许 bilibili&a 和 bilibili&b）
-            // 也就是说，我们完全不检查 selectedTagElements
+            // 仅禁止同一合并组内重复：已选项需保持可选取，才能把已选源组合成合并组。
             if (stagingTokens.has(value)) {
                 shouldDisable = true;
             }
         } else {
             // [普通模式逻辑]
-            // 只要已经被选了，就禁用 (精准匹配)
-            const isAlreadySelected = selectedTagElements.some(el => el.dataset.value === value);
+            // 排序配置按组成源判断，其他多选配置保持完整值精准匹配。
+            const isAlreadySelected = preventDuplicateSources
+                ? selectedSourceTokens.has(value)
+                : selectedTagElements.some(el => el.dataset.value === value);
             if (isAlreadySelected) {
                 shouldDisable = true;
             }
@@ -1139,6 +1695,8 @@ function updateTagStates() {
 function addSelectedTag(element) {
     const value = element.dataset.value;
 
+    if (element.classList.contains('disabled')) return;
+
     if (isMergeMode) {
         if (!stagingTags.includes(value)) {
             stagingTags.push(value);
@@ -1147,8 +1705,6 @@ function addSelectedTag(element) {
         }
         return;
     }
-
-    if (element.classList.contains('disabled')) return;
     
     const container = document.getElementById('selected-tags');
 
@@ -1210,12 +1766,12 @@ function toggleMergeMode() {
 
     if (isMergeMode) {
         btn.classList.add('active');
-        btn.innerHTML = '<span class="icon">⛓‍💥</span> 合并模式已开启，点击关闭';
+        btn.innerHTML = uiIcon('unlink') + ' 合并模式';
         stagingArea.classList.add('active');
         renderStagingArea();
     } else {
         btn.classList.remove('active');
-        btn.innerHTML = '<span class="icon">🔗️</span> 点击开启合并模式';
+        btn.innerHTML = uiIcon('link') + ' 合并模式';
         stagingArea.classList.remove('active');
         stagingTags = [];
     }
@@ -1305,6 +1861,7 @@ function setupStagingDragAndDrop() {
         tag.addEventListener('touchstart', handleStagingTouchStart);
         tag.addEventListener('touchmove', handleStagingTouchMove);
         tag.addEventListener('touchend', handleStagingTouchEnd);
+        tag.addEventListener('touchcancel', handleStagingTouchCancel);
     });
 }
 
@@ -1321,6 +1878,7 @@ function handleStagingDragEnd(e) {
     document.querySelectorAll('.staging-tag').forEach(tag => {
         tag.classList.remove('drag-over');
     });
+    stagingDraggedElement = null;
 }
 
 function handleStagingDragOver(e) {
@@ -1435,7 +1993,7 @@ function handleStagingTouchEnd(e) {
     
     const touch = e.changedTouches[0];
     const targetElement = document.elementFromPoint(touch.clientX, touch.clientY);
-    const targetTag = targetElement.closest('.staging-tag');
+    const targetTag = targetElement ? targetElement.closest('.staging-tag') : null;
     
     if (targetTag && targetTag !== stagingDraggedElement) {
         const draggedIndex = parseInt(stagingDraggedElement.dataset.index);
@@ -1459,45 +2017,175 @@ function handleStagingTouchEnd(e) {
     stagingDraggedElement = null;
 }
 
+function handleStagingTouchCancel(e) {
+    if (e && e.cancelable) e.preventDefault();
+
+    const ghostElement = document.getElementById('staging-touch-drag-ghost');
+    if (ghostElement) ghostElement.remove();
+
+    if (stagingDraggedElement) {
+        stagingDraggedElement.style.transform = '';
+        stagingDraggedElement.style.opacity = '';
+        stagingDraggedElement.style.zIndex = '';
+        stagingDraggedElement.classList.remove('dragging');
+    }
+
+    document.querySelectorAll('#staging-area .staging-tag').forEach(tag => {
+        tag.classList.remove('drag-over');
+    });
+    stagingDraggedElement = null;
+}
+
 // 设置拖放功能
 let draggedElement = null;
 let touchDragging = false;
+let touchDragFrame = null;
 
-// 为删除按钮添加触摸事件监听器，以确保其可以被点击
 function setupDragAndDrop() {
     const container = document.getElementById('selected-tags');
-    const tags = container.querySelectorAll('.selected-tag');
+    if (!container) return;
+    if (container.dataset.dragEventsBound === 'true') return;
 
+    // 使用事件委托，让初始标签和运行时新增标签走同一套拖拽生命周期。
+    container.addEventListener('dragstart', handleDelegatedDragStart);
+    container.addEventListener('dragend', handleDelegatedDragEnd);
+    container.addEventListener('dragover', handleDelegatedDragOver);
+    container.addEventListener('drop', handleDelegatedDrop);
+    container.addEventListener('dragenter', handleDelegatedDragEnter);
+    container.addEventListener('dragleave', handleDelegatedDragLeave);
+    container.addEventListener('touchstart', handleDelegatedTouchStart, { passive: false });
+    container.dataset.dragEventsBound = 'true';
+}
+
+function getEventSelectedTag(e) {
+    const container = document.getElementById('selected-tags');
+    const tag = e.target && e.target.closest ? e.target.closest('.selected-tag') : null;
+    return tag && container && container.contains(tag) && !tag.dataset.dragGhost ? tag : null;
+}
+
+function handleDelegatedDragStart(e) {
+    const tag = getEventSelectedTag(e);
+    if (tag) handleDragStart.call(tag, e);
+}
+
+function handleDelegatedDragEnd(e) {
+    const tag = getEventSelectedTag(e);
+    if (tag) handleDragEnd.call(tag, e);
+}
+
+function handleDelegatedDragOver(e) {
+    const tag = getEventSelectedTag(e);
+    if (tag) {
+        handleDragOver.call(tag, e);
+    } else {
+        handleSelectedTagsContainerDragOver(e);
+    }
+}
+
+function handleDelegatedDrop(e) {
+    const tag = getEventSelectedTag(e);
+    if (tag) {
+        handleDrop.call(tag, e);
+    } else {
+        handleSelectedTagsContainerDrop(e);
+    }
+}
+
+function handleDelegatedDragEnter(e) {
+    const tag = getEventSelectedTag(e);
+    if (tag) handleDragEnter.call(tag, e);
+}
+
+function handleDelegatedDragLeave(e) {
+    const tag = getEventSelectedTag(e);
+    if (tag) handleDragLeave.call(tag, e);
+}
+
+function handleDelegatedTouchStart(e) {
+    const tag = getEventSelectedTag(e);
+    if (tag) handleTouchStart.call(tag, e);
+}
+
+function getSelectedDropTarget(clientX, clientY) {
+    const container = document.getElementById('selected-tags');
+    if (!container || !draggedElement) return null;
+
+    const pointElement = document.elementFromPoint(clientX, clientY);
+    const directTag = pointElement ? pointElement.closest('.selected-tag') : null;
+    if (directTag === draggedElement) return null;
+    if (directTag && container.contains(directTag) && !directTag.dataset.dragGhost) {
+        return { tag: directTag, direct: true };
+    }
+
+    const containerRect = container.getBoundingClientRect();
+    const insideContainer = clientX >= containerRect.left && clientX <= containerRect.right &&
+        clientY >= containerRect.top && clientY <= containerRect.bottom;
+    if (!insideContainer) return null;
+
+    const tags = getSelectedTagElements().filter(tag => tag !== draggedElement);
+    if (tags.length === 0) return { tag: null, direct: false };
+
+    let closestTag = tags[0];
+    let closestDistance = Infinity;
     tags.forEach(tag => {
-        // 鼠标拖放事件
-        tag.addEventListener('dragstart', handleDragStart);
-        tag.addEventListener('dragend', handleDragEnd);
-        tag.addEventListener('dragover', handleDragOver);
-        tag.addEventListener('drop', handleDrop);
-        tag.addEventListener('dragenter', handleDragEnter);
-        tag.addEventListener('dragleave', handleDragLeave);
-        
-        // 触摸拖放事件
-        tag.addEventListener('touchstart', handleTouchStart);
-        tag.addEventListener('touchmove', handleTouchMove);
-        tag.addEventListener('touchend', handleTouchEnd);
-        
-        // 确保删除按钮可以被点击
-        const removeBtn = tag.querySelector('.remove-btn');
-        if (removeBtn) {
-            // 阻止删除按钮上的触摸事件冒泡到父元素
-            removeBtn.addEventListener('touchstart', function(e) {
-                e.stopPropagation();
-            });
-            
-            removeBtn.addEventListener('touchend', function(e) {
-                e.stopPropagation();
-            });
+        const rect = tag.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        const distance = Math.pow(clientX - centerX, 2) + Math.pow(clientY - centerY, 2);
+        if (distance < closestDistance) {
+            closestDistance = distance;
+            closestTag = tag;
         }
     });
+
+    return { tag: closestTag, direct: false };
+}
+
+function moveSelectedTagToPoint(clientX, clientY) {
+    const container = document.getElementById('selected-tags');
+    const dropTarget = getSelectedDropTarget(clientX, clientY);
+    if (!container || !draggedElement || !dropTarget) return false;
+
+    const targetTag = dropTarget.tag;
+    if (!targetTag) {
+        container.appendChild(draggedElement);
+        return true;
+    }
+
+    const allTags = getSelectedTagElements();
+    const draggedIndex = allTags.indexOf(draggedElement);
+    const targetIndex = allTags.indexOf(targetTag);
+
+    if (dropTarget.direct) {
+        container.insertBefore(draggedElement, draggedIndex < targetIndex ? targetTag.nextSibling : targetTag);
+        return true;
+    }
+
+    const targetRect = targetTag.getBoundingClientRect();
+    const onSameRow = clientY >= targetRect.top && clientY <= targetRect.bottom;
+    const insertBefore = onSameRow
+        ? clientX < targetRect.left + targetRect.width / 2
+        : clientY < targetRect.top + targetRect.height / 2;
+    container.insertBefore(draggedElement, insertBefore ? targetTag : targetTag.nextSibling);
+    return true;
+}
+
+function handleSelectedTagsContainerDragOver(e) {
+    if (!draggedElement) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+}
+
+function handleSelectedTagsContainerDrop(e) {
+    const targetTag = e.target && e.target.closest ? e.target.closest('.selected-tag') : null;
+    if (!draggedElement || targetTag) return;
+    e.preventDefault();
+    e.stopPropagation();
+    moveSelectedTagToPoint(e.clientX, e.clientY);
 }
 
 function handleDragStart(e) {
+    cleanupSelectedTagsTouchDrag();
     draggedElement = this;
     this.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
@@ -1505,9 +2193,10 @@ function handleDragStart(e) {
 
 function handleDragEnd(e) {
     this.classList.remove('dragging');
-    document.querySelectorAll('.selected-tag').forEach(tag => {
+    getSelectedTagElements().forEach(tag => {
         tag.classList.remove('drag-over');
     });
+    draggedElement = null;
 }
 
 function handleDragOver(e) {
@@ -1535,7 +2224,7 @@ function handleDrop(e) {
 
     if (draggedElement !== this) {
         const container = document.getElementById('selected-tags');
-        const allTags = Array.from(container.querySelectorAll('.selected-tag'));
+        const allTags = getSelectedTagElements();
         const draggedIndex = allTags.indexOf(draggedElement);
         const targetIndex = allTags.indexOf(this);
 
@@ -1553,7 +2242,7 @@ function handleDrop(e) {
 // 触摸拖动事件处理
 function handleTouchStart(e) {
     // 检查点击的是否是删除按钮
-    if (e.target.classList.contains('remove-btn')) {
+    if (e.target && e.target.closest && e.target.closest('.remove-btn')) {
         // 如果点击的是删除按钮，则不执行拖动操作
         return;
     }
@@ -1561,10 +2250,8 @@ function handleTouchStart(e) {
     // 防止默认的触摸行为
     e.preventDefault();
     
-    // 获取触摸点
-    const touch = e.touches[0];
-    
     // 模拟拖动开始
+    cleanupSelectedTagsTouchDrag();
     draggedElement = this;
     this.classList.add('dragging');
     touchDragging = true;
@@ -1577,6 +2264,7 @@ function handleTouchStart(e) {
     // 添加触摸移动和结束事件监听器到文档
     document.addEventListener('touchmove', handleTouchMove, { passive: false });
     document.addEventListener('touchend', handleTouchEnd, { passive: false });
+    document.addEventListener('touchcancel', handleTouchCancel, { passive: false });
 }
 
 function handleTouchMove(e) {
@@ -1585,111 +2273,51 @@ function handleTouchMove(e) {
     // 防止默认的触摸行为
     e.preventDefault();
     
-    // 使用 requestAnimationFrame 来优化性能
-    if (window.requestAnimationFrame) {
-        window.requestAnimationFrame(() => {
-            // 获取触摸点位置
-            const touch = e.touches[0];
-            
-            // 获取拖动元素的尺寸
-            const elementRect = draggedElement.getBoundingClientRect();
-            
-            // 创建一个临时的拖动元素，而不是移动原始元素
-            if (!document.getElementById('touch-drag-ghost')) {
-                const ghostElement = draggedElement.cloneNode(true);
-                ghostElement.id = 'touch-drag-ghost';
-                ghostElement.style.position = 'fixed'; // 使用 fixed 而不是 absolute
-                ghostElement.style.left = '0';
-                ghostElement.style.top = '0';
-                ghostElement.style.pointerEvents = 'none'; // 防止干扰触摸事件
-                ghostElement.style.zIndex = '9999';
-                ghostElement.style.transform = 'translate(' + (touch.clientX - (elementRect.width / 2)) + 'px, ' + (touch.clientY - (elementRect.height / 2)) + 'px) rotate(5deg)';
-                ghostElement.style.opacity = '0.8';
-                ghostElement.style.boxSizing = 'border-box'; // 确保尺寸计算正确
-                ghostElement.style.width = elementRect.width + 'px'; // 固定宽度
-                ghostElement.style.height = elementRect.height + 'px'; // 固定高度
-                document.body.appendChild(ghostElement);
-            } else {
-                const ghostElement = document.getElementById('touch-drag-ghost');
-                ghostElement.style.transform = 'translate(' + (touch.clientX - (elementRect.width / 2)) + 'px, ' + (touch.clientY - (elementRect.height / 2)) + 'px) rotate(5deg)';
-            }
-            
-            // 检查与其他元素的碰撞
-            const container = document.getElementById('selected-tags');
-            const tags = Array.from(container.querySelectorAll('.selected-tag')).filter(tag => tag !== draggedElement);
-            let targetElement = null;
-            
-            for (const tag of tags) {
-                const rect = tag.getBoundingClientRect();
-                if (touch.clientX >= rect.left && touch.clientX <= rect.right &&
-                    touch.clientY >= rect.top && touch.clientY <= rect.bottom) {
-                    targetElement = tag;
-                    break;
-                }
-            }
-            
-            // 高亮目标元素
-            document.querySelectorAll('.selected-tag').forEach(tag => {
-                if (tag !== draggedElement) {
-                    tag.classList.remove('drag-over');
-                }
-            });
-            
-            if (targetElement) {
-                targetElement.classList.add('drag-over');
-            }
-        });
-    } else {
-        // 降级处理，如果不支持 requestAnimationFrame
-        const touch = e.touches[0];
-        
-        // 获取拖动元素的尺寸
+    const touch = e.touches[0];
+    if (!touch) return;
+    const clientX = touch.clientX;
+    const clientY = touch.clientY;
+
+    if (touchDragFrame !== null && window.cancelAnimationFrame) {
+        window.cancelAnimationFrame(touchDragFrame);
+    }
+
+    const updatePreview = () => {
+        touchDragFrame = null;
+        if (!touchDragging || !draggedElement) return;
+
         const elementRect = draggedElement.getBoundingClientRect();
-        
-        // 创建一个临时的拖动元素，而不是移动原始元素
-        if (!document.getElementById('touch-drag-ghost')) {
-            const ghostElement = draggedElement.cloneNode(true);
+        let ghostElement = document.getElementById('touch-drag-ghost');
+        if (!ghostElement) {
+            ghostElement = draggedElement.cloneNode(true);
             ghostElement.id = 'touch-drag-ghost';
-            ghostElement.style.position = 'fixed'; // 使用 fixed 而不是 absolute
+            ghostElement.dataset.dragGhost = 'true';
+            ghostElement.setAttribute('aria-hidden', 'true');
+            ghostElement.removeAttribute('draggable');
+            ghostElement.style.position = 'fixed';
             ghostElement.style.left = '0';
             ghostElement.style.top = '0';
-            ghostElement.style.pointerEvents = 'none'; // 防止干扰触摸事件
+            ghostElement.style.pointerEvents = 'none';
             ghostElement.style.zIndex = '9999';
-            ghostElement.style.transform = 'translate(' + (touch.clientX - (elementRect.width / 2)) + 'px, ' + (touch.clientY - (elementRect.height / 2)) + 'px) rotate(5deg)';
             ghostElement.style.opacity = '0.8';
-            ghostElement.style.boxSizing = 'border-box'; // 确保尺寸计算正确
-            ghostElement.style.width = elementRect.width + 'px'; // 固定宽度
-            ghostElement.style.height = elementRect.height + 'px'; // 固定高度
+            ghostElement.style.boxSizing = 'border-box';
+            ghostElement.style.width = elementRect.width + 'px';
+            ghostElement.style.height = elementRect.height + 'px';
             document.body.appendChild(ghostElement);
-        } else {
-            const ghostElement = document.getElementById('touch-drag-ghost');
-            ghostElement.style.transform = 'translate(' + (touch.clientX - (elementRect.width / 2)) + 'px, ' + (touch.clientY - (elementRect.height / 2)) + 'px) rotate(5deg)';
         }
-        
-        // 检查与其他元素的碰撞
-        const container = document.getElementById('selected-tags');
-        const tags = Array.from(container.querySelectorAll('.selected-tag')).filter(tag => tag !== draggedElement);
-        let targetElement = null;
-        
-        for (const tag of tags) {
-            const rect = tag.getBoundingClientRect();
-            if (touch.clientX >= rect.left && touch.clientX <= rect.right &&
-                touch.clientY >= rect.top && touch.clientY <= rect.bottom) {
-                targetElement = tag;
-                break;
-            }
-        }
-        
-        // 高亮目标元素
-        document.querySelectorAll('.selected-tag').forEach(tag => {
-            if (tag !== draggedElement) {
-                tag.classList.remove('drag-over');
-            }
+        ghostElement.style.transform = 'translate(' + (clientX - (elementRect.width / 2)) + 'px, ' + (clientY - (elementRect.height / 2)) + 'px) rotate(5deg)';
+
+        const dropTarget = getSelectedDropTarget(clientX, clientY);
+        getSelectedTagElements().forEach(tag => {
+            if (tag !== draggedElement) tag.classList.remove('drag-over');
         });
-        
-        if (targetElement) {
-            targetElement.classList.add('drag-over');
-        }
+        if (dropTarget && dropTarget.tag) dropTarget.tag.classList.add('drag-over');
+    };
+
+    if (window.requestAnimationFrame) {
+        touchDragFrame = window.requestAnimationFrame(updatePreview);
+    } else {
+        updatePreview();
     }
 }
 
@@ -1699,51 +2327,42 @@ function handleTouchEnd(e) {
     // 防止默认的触摸行为
     e.preventDefault();
     
-    // 移除临时拖动元素
-    const ghostElement = document.getElementById('touch-drag-ghost');
-    if (ghostElement) {
-        document.body.removeChild(ghostElement);
-    }
-    
-    // 找到目标元素（如果有）
-    const touch = e.changedTouches[0];
-    const targetElement = document.elementFromPoint(touch.clientX, touch.clientY);
-    
-    const container = document.getElementById('selected-tags');
-    const targetTag = targetElement.closest('.selected-tag');
-    
-    // 如果目标是另一个标签，执行交换
-    if (targetTag && targetTag !== draggedElement && container.contains(targetTag)) {
-        const allTags = Array.from(container.querySelectorAll('.selected-tag'));
-        const draggedIndex = allTags.indexOf(draggedElement);
-        const targetIndex = allTags.indexOf(targetTag);
+    const touch = e.changedTouches && e.changedTouches[0];
+    if (touch) moveSelectedTagToPoint(touch.clientX, touch.clientY);
+    cleanupSelectedTagsTouchDrag();
+}
 
-        if (draggedIndex < targetIndex) {
-            targetTag.parentNode.insertBefore(draggedElement, targetTag.nextSibling);
-        } else {
-            targetTag.parentNode.insertBefore(draggedElement, targetTag);
-        }
+function handleTouchCancel(e) {
+    if (e && e.cancelable) e.preventDefault();
+    cleanupSelectedTagsTouchDrag();
+}
+
+function cleanupSelectedTagsTouchDrag() {
+    if (touchDragFrame !== null && window.cancelAnimationFrame) {
+        window.cancelAnimationFrame(touchDragFrame);
     }
-    
-    // 重置元素样式
-    draggedElement.style.transform = '';
-    draggedElement.style.opacity = '';
-    draggedElement.style.zIndex = '';
-    
-    // 移除拖动类
-    draggedElement.classList.remove('dragging');
-    document.querySelectorAll('.selected-tag').forEach(tag => {
-        tag.classList.remove('drag-over');
-    });
-    
-    // 重置变量
+    touchDragFrame = null;
+
+    const ghostElement = document.getElementById('touch-drag-ghost');
+    if (ghostElement) ghostElement.remove();
+
+    if (draggedElement && touchDragging) {
+        draggedElement.style.transform = '';
+        draggedElement.style.opacity = '';
+        draggedElement.style.zIndex = '';
+        draggedElement.classList.remove('dragging');
+    }
+    getSelectedTagElements().forEach(tag => tag.classList.remove('drag-over'));
+
     touchDragging = false;
-    draggedElement = null;
-    
-    // 移除事件监听器
+    if (draggedElement && !draggedElement.classList.contains('dragging')) draggedElement = null;
+
     document.removeEventListener('touchmove', handleTouchMove);
     document.removeEventListener('touchend', handleTouchEnd);
+    document.removeEventListener('touchcancel', handleTouchCancel);
 }
+
+window.addEventListener('blur', cleanupSelectedTagsTouchDrag);
 
 // 显示加载遮罩
 function showLoading(text, detail) {
@@ -1774,46 +2393,126 @@ function updateProgress(percent) {
     document.getElementById('progress-bar').style.width = percent + '%';
 }
 
-// 渲染环境变量列表
-function renderEnvList() {
-    const list = document.getElementById('env-list');
-    const items = envVariables[currentCategory] || [];
+function renderEnvNavigation() {
+    const navigation = document.getElementById('env-categories');
+    if (!navigation) return;
 
-    if (items.length === 0) {
-        list.innerHTML = '<p class="text-gray padding-20 text-center">暂无配置项</p>';
-        return;
-    }
-
-    list.innerHTML = items.map((item, index) => {
-        const typeLabel = item.type === 'boolean' ? '布尔' :
-                         item.type === 'number' ? '数字' :
-                         item.type === 'select' ? '单选' :
-                         item.type === 'map' ? '映射' :
-                         item.type === 'multi-select' ? '多选' : '文本';
-        const badgeClass = item.type === 'multi-select' ? 'multi' : '';
-
-        const escapedValue = escapeHtml(item.value);
-
-        return \`
-            <div class="env-item">
-                <div class="env-info">
-                    <strong>\${item.key}<span class="value-type-badge \${badgeClass}">\${typeLabel}</span></strong>
-                    <div class="text-dark-gray">\${escapedValue}</div>
-                    <div class="text-gray font-size-12 margin-top-3">\${item.description || '无描述'}</div>
-                </div>
-                <div class="env-actions">
-                    <button class="btn btn-primary" onclick="editEnv(\${index})">编辑</button>
-                    <button class="btn btn-danger" onclick="deleteEnv(\${index})">删除</button>
-                </div>
-            </div>
-        \`;
+    navigation.innerHTML = previewCategoryOrder.map(category => {
+        const isActive = !envSearchQuery && currentCategory === category;
+        return renderCategoryNavButton(category, (envVariables[category] || []).length, isActive, "switchCategory('" + category + "')");
     }).join('');
 }
 
+function envItemMatchesSearch(item, category, normalizedQuery) {
+    const value = item.value === null || item.value === undefined ? '' : String(item.value);
+    const themeLabel = item.key === 'UI_THEME' ? UI_THEMES[value.toLowerCase()] || '' : '';
+    return [
+        item.key,
+        value,
+        item.description,
+        previewCategoryMeta[category].label,
+        themeLabel
+    ].join(' ').toLocaleLowerCase().includes(normalizedQuery);
+}
+
+function renderEnvItem(item, category, originalIndex) {
+    const typeLabel = getEnvTypeLabel(item.type);
+    const badgeClass = item.type === 'multi-select' ? 'multi' : '';
+
+    return \`
+        <div class="env-item">
+            <div class="env-info">
+                <strong>\${escapeHtml(item.key)}<span class="value-type-badge \${badgeClass}">\${typeLabel}</span></strong>
+                <div class="text-dark-gray">\${escapeHtml(item.value)}</div>
+                <div class="text-gray font-size-12 margin-top-3">\${escapeHtml(item.description || '无描述')}</div>
+            </div>
+            <div class="env-actions">
+                <button class="btn btn-primary" onclick="editEnv('\${category}', \${originalIndex}, this)">编辑</button>
+                <button class="btn btn-danger" onclick="deleteEnv('\${category}', \${originalIndex}, this)">删除</button>
+            </div>
+        </div>
+    \`;
+}
+
+function handleEnvSearch(event) {
+    envSearchQuery = event.target.value.trim();
+    const clearButton = document.getElementById('env-search-clear');
+    if (clearButton) clearButton.hidden = !envSearchQuery;
+    renderEnvList();
+}
+
+function clearEnvSearch(shouldRender = true) {
+    envSearchQuery = '';
+    const input = document.getElementById('env-search-input');
+    const clearButton = document.getElementById('env-search-clear');
+    if (input) input.value = '';
+    if (clearButton) clearButton.hidden = true;
+    if (shouldRender) {
+        renderEnvList();
+        if (input) input.focus();
+    }
+}
+
+// 渲染环境变量列表
+function renderEnvList() {
+    const list = document.getElementById('env-list');
+    const status = document.getElementById('env-search-status');
+    const themeSettings = document.getElementById('theme-settings');
+    if (!list) return;
+
+    renderEnvNavigation();
+
+    if (!envSearchQuery) {
+        const categoryItems = envVariables[currentCategory] || [];
+        const items = categoryItems
+            .map((item, originalIndex) => ({ item, originalIndex }))
+            .filter(({ item }) => item.key !== 'UI_THEME');
+
+        if (themeSettings) themeSettings.hidden = currentCategory !== 'system';
+        if (status) status.textContent = previewCategoryMeta[currentCategory].label + ' · ' + categoryItems.length + ' 项';
+        list.innerHTML = items.length
+            ? items.map(({ item, originalIndex }) => renderEnvItem(item, currentCategory, originalIndex)).join('')
+            : '<p class="text-gray padding-20 text-center">暂无配置项</p>';
+        return;
+    }
+
+    const normalizedQuery = envSearchQuery.toLocaleLowerCase();
+    let total = 0;
+    let themeMatched = false;
+    let html = '';
+
+    previewCategoryOrder.forEach(category => {
+        const matches = (envVariables[category] || [])
+            .map((item, originalIndex) => ({ item, originalIndex }))
+            .filter(({ item }) => envItemMatchesSearch(item, category, normalizedQuery));
+
+        const regularMatches = matches.filter(({ item }) => item.key !== 'UI_THEME');
+        themeMatched = themeMatched || matches.some(({ item }) => item.key === 'UI_THEME');
+        total += matches.length;
+
+        if (!regularMatches.length) return;
+        html += \`
+            <section class="preview-group env-search-group">
+                <div class="preview-group-heading">
+                    \${renderCategoryHeading(category)}
+                    <span>\${regularMatches.length} 项</span>
+                </div>
+                <div>
+                    \${regularMatches.map(({ item, originalIndex }) => renderEnvItem(item, category, originalIndex)).join('')}
+                </div>
+            </section>
+        \`;
+    });
+
+    if (themeSettings) themeSettings.hidden = !themeMatched;
+    if (status) status.textContent = '搜索结果 · ' + total + ' 项';
+    list.innerHTML = html || (themeMatched ? '' : '<div class="preview-empty"><strong>未找到匹配配置</strong><span>请尝试其他关键词</span></div>');
+}
+
 // 编辑环境变量
-function editEnv(index) {
-    const item = envVariables[currentCategory][index];
-    const editButton = event.target; // 获取当前点击的编辑按钮
+function editEnv(category, index, editButton) {
+    const item = (envVariables[category] || [])[index];
+    if (!item || !editButton) return;
     
     // 设置按钮为加载状态
     const originalText = editButton.innerHTML;
@@ -1821,22 +2520,22 @@ function editEnv(index) {
     editButton.disabled = true;
     
     editingKey = index;
-    document.getElementById('modal-title').textContent = '编辑配置项';
-    document.getElementById('env-category').value = currentCategory;
-    document.getElementById('env-key').value = item.key;
-    document.getElementById('env-description').value = item.description || '';
-    document.getElementById('value-type').value = item.type || 'text';
+    editingCategory = category;
+    editingKeyName = item.key;
+    editingType = item.type || 'text';
 
-    // 设置字段为只读（编辑模式下）
-    document.getElementById('env-category').disabled = true;
-    document.getElementById('env-key').readOnly = true;
-    document.getElementById('value-type').disabled = true;
-    document.getElementById('env-description').readOnly = true;
+    document.getElementById('modal-title').textContent = '编辑配置项';
+    document.getElementById('env-category-display').textContent =
+        (previewCategoryMeta[category] && previewCategoryMeta[category].label) || category;
+    document.getElementById('env-key-display').textContent = item.key;
+    document.getElementById('value-type-display').textContent = getEnvTypeLabel(item.type || 'text');
+    document.getElementById('env-description-display').textContent = item.description || '';
 
     // 渲染对应的值输入控件
     renderValueInput(item);
 
     document.getElementById('env-modal').classList.add('active');
+    lockPageScroll();
     
     // 恢复按钮状态（在实际场景中，这会在编辑完成后发生，比如在保存后或取消后）
     // 为了演示，这里立即恢复按钮状态，实际使用中应该在适当的地方恢复按钮状态
@@ -1845,12 +2544,12 @@ function editEnv(index) {
 }
 
 // 删除环境变量
-function deleteEnv(index) {
+function deleteEnv(category, index, deleteButton) {
     customConfirm('确定要删除这个配置项吗?', '删除确认').then(confirmed => {
         if (confirmed) {
-            const item = envVariables[currentCategory][index];
+            const item = (envVariables[category] || [])[index];
+            if (!item || !deleteButton) return;
             const key = item.key;
-            const deleteButton = event.target; // 获取当前点击的删除按钮
 
             // 设置按钮为加载状态
             const originalText = deleteButton.innerHTML;
@@ -1869,7 +2568,7 @@ function deleteEnv(index) {
             .then(result => {
                 if (result.success) {
                     // 从本地数据中删除
-                    envVariables[currentCategory].splice(index, 1);
+                    envVariables[category].splice(index, 1);
                     renderEnvList();
                     renderPreview();
                     addLog(\`删除配置项: \${key}\`, 'warn');
@@ -1895,10 +2594,14 @@ function deleteEnv(index) {
 document.getElementById('env-form').addEventListener('submit', async function(e) {
     e.preventDefault();
 
-    const category = document.getElementById('env-category').value;
-    const key = document.getElementById('env-key').value.trim();
-    const description = document.getElementById('env-description').value.trim();
-    const type = document.getElementById('value-type').value;
+    const category = editingCategory || 'api';
+    const key = editingKeyName;
+    const description = (document.getElementById('env-description-display').textContent || '').trim();
+    const type = editingType;
+    const targetCategory = editingCategory || category;
+    const existingItem = editingKey !== null && envVariables[targetCategory]
+        ? envVariables[targetCategory][editingKey]
+        : null;
 
     // 根据类型获取值
     let value, itemData;
@@ -1922,13 +2625,15 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
             confirmMergeGroup();
         }
 
-        const selectedTags = Array.from(document.querySelectorAll('.selected-tag'))
-            .map(el => el.dataset.value);
+        const selectedTags = [...new Set(
+            getSelectedTagElements().map(el => el.dataset.value).filter(Boolean)
+        )];
         value = selectedTags.join(',');
         const options = Array.from(document.querySelectorAll('.available-tag')).map(el => el.dataset.value);
         itemData = { key, value, description, type, options };
     } else if (type === 'map') {
         // 获取映射表值
+        parseBulkMapItems(true);
         const mapItems = document.querySelectorAll('#map-container .map-item');
         const pairs = [];
         mapItems.forEach(item => {
@@ -1947,8 +2652,17 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
         itemData = { key, value, description, type };
     }
 
+    // 掩码值（预览星号）表示凭据未改动，跳过写入以免用星号覆盖服务端已存真实值
+    const isMasked = /^[*]+$/.test(value);
+
     // 调用API更新环境变量 - 先尝试set接口，失败则调用add接口
     try {
+        if (isMasked) {
+            // 凭据值未变更，保留服务端已存值，仅关闭编辑框
+            addLog(\`配置项 \${key} 未变更，已保留原值\`, 'info');
+            closeModal();
+            return;
+        }
         // 首先尝试使用set接口更新
         let response = await fetch(buildApiUrl('/api/env/set'), {
             method: 'POST',
@@ -1980,18 +2694,19 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
             }
 
             if (editingKey !== null) {
-                envVariables[currentCategory][editingKey] = itemData;
+                envVariables[targetCategory][editingKey] = {
+                    ...(existingItem || {}),
+                    ...itemData
+                };
                 addLog(\`更新配置项: \${key} = \${value}\`, 'success');
             } else {
                 envVariables[category].push(itemData);
                 addLog(\`添加配置项: \${key} = \${value}\`, 'success');
             }
 
-            if (category !== currentCategory) {
+            if (editingKey === null && category !== currentCategory) {
                 currentCategory = category;
-                document.querySelectorAll('.category-btn').forEach((btn, i) => {
-                    btn.classList.toggle('active', ['api', 'source', 'match', 'danmu', 'cache', 'system'][i] === category);
-                });
+                clearEnvSearch(false);
             }
 
             renderEnvList();
@@ -2005,9 +2720,32 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
     } catch (error) {
         addLog(\`更新环境变量失败: \${error.message}\`, 'error');
         addLog(\`❌ 更新环境变量失败: \${error.message}\`, 'error');
-        customAlert(result.message + '，请检查部署平台相关环境变量配置是否正确');
+        customAlert(error.message + '，请检查部署平台相关环境变量配置是否正确');
     }
 });
+
+function parseBulkMapItems(silent = false) {
+    const input = document.getElementById('map-bulk-value');
+    const container = document.getElementById('map-container');
+    if (!input || !container) return false;
+    const latest = new Map(); const invalid = [];
+    String(input.value || '').split(/[;\\r\\n]+/).forEach((raw, index) => {
+        const text = raw.trim(); if (!text) return;
+        const pos = text.indexOf('->');
+        if (pos < 1 || !text.slice(pos + 2).trim()) { invalid.push(index + 1); return; }
+        latest.set(text.slice(0, pos).trim(), text.slice(pos + 2).trim());
+    });
+    container.querySelectorAll('.map-item').forEach(item => item.remove());
+    for (const [left, right] of latest) {
+        const row = document.createElement('div'); row.className = 'map-item';
+        row.innerHTML = '<input type="text" class="map-input-left"><span class="map-separator">-&gt;</span><input type="text" class="map-input-right"><button type="button" class="btn btn-danger map-remove-btn" onclick="removeMapItem(this)">删除</button>';
+        row.querySelector('.map-input-left').value = left;
+        row.querySelector('.map-input-right').value = right;
+        container.insertBefore(row, container.querySelector('.map-item-template'));
+    }
+    if (invalid.length && !silent) addLog('Invalid mapping entries ignored: ' + invalid.join(', '), 'warning');
+    return invalid.length === 0;
+}
 
 // 添加映射项
 function addMapItem() {
@@ -2020,6 +2758,8 @@ function addMapItem() {
     const index = container.querySelectorAll('.map-item').length;
     newItem.setAttribute('data-index', index);
     container.appendChild(newItem);
+    newItem.querySelectorAll('.map-input-left, .map-input-right').forEach(input => input.addEventListener('input', syncBulkMapValue));
+    syncBulkMapValue();
 }
 
 // 删除映射项
@@ -2027,7 +2767,24 @@ function removeMapItem(button) {
     const item = button.closest('.map-item');
     if (item) {
         item.remove();
+        syncBulkMapValue();
     }
+}
+
+function syncBulkMapValue() {
+    const input = document.getElementById('map-bulk-value');
+    if (!input) return;
+    input.value = Array.from(document.querySelectorAll('#map-container .map-item')).map(item => {
+        const l = item.querySelector('.map-input-left')?.value.trim();
+        const r = item.querySelector('.map-input-right')?.value.trim();
+        return l && r ? l + '->' + r : '';
+    }).filter(Boolean).join(';');
+}
+
+function bindMapInputSync() {
+    document.querySelectorAll('#map-container .map-input-left, #map-container .map-input-right').forEach(input => {
+        input.addEventListener('input', syncBulkMapValue);
+    });
 }
 /* ========================================
    Bilibili Cookie 扫码登录功能
@@ -2042,7 +2799,7 @@ async function startBilibiliQRLogin() {
             <div class="modal" id="bili-qr-modal">
                 <div class="modal-content" style="max-width: 400px;">
                     <div class="modal-header">
-                        <h3>📱 扫码登录 Bilibili</h3>
+                        <h3 class="ui-icon-label">\${uiIcon('qr-code')} 扫码登录 Bilibili</h3>
                         <button class="close-btn" onclick="closeBiliQRModal()">×</button>
                     </div>
                     <div class="modal-body" style="text-align: center;">
@@ -2095,7 +2852,7 @@ async function startBilibiliQRLogin() {
         }
     } catch (error) {
         qrLoading.style.display = 'none';
-        qrStatus.textContent = '❌ ' + error.message;
+        uiSetStatus(qrStatus, 'x-circle', error.message);
     }
 }
 
@@ -2119,17 +2876,17 @@ function startBiliQRCheck() {
                 
                 switch (code) {
                     case 86101:
-                        qrStatus.textContent = '⏳ 等待扫码...';
+                        uiSetStatus(qrStatus, 'clock', '等待扫码...');
                         break;
                     case 86090:
-                        qrStatus.textContent = '📱 已扫码，请确认';
+                        uiSetStatus(qrStatus, 'qr-code', '已扫码，请确认');
                         break;
                     case 86038:
-                        qrStatus.textContent = '❌ 二维码已过期';
+                        uiSetStatus(qrStatus, 'x-circle', '二维码已过期');
                         clearInterval(biliQRCheckInterval);
                         break;
                     case 0:
-                        qrStatus.textContent = '✅ 登录成功！';
+                        uiSetStatus(qrStatus, 'check-circle', '登录成功！');
                         clearInterval(biliQRCheckInterval);
                         
                         if (result.data.cookie) {
@@ -2184,11 +2941,11 @@ async function autoCheckBilibiliCookieStatus() {
     
     // 如果输入框为空,提示未配置
     if (!cookie) {
-        statusEl.innerHTML = '<span class="bili-status-icon">⚠️</span><span class="bili-status-text">未配置</span>';
+        statusEl.innerHTML = \`<span class="bili-status-icon">\${uiIcon('alert-triangle')}</span><span class="bili-status-text">未配置</span>\`;
         return;
     }
     
-    statusEl.innerHTML = '<span class="bili-status-icon">🔍</span><span class="bili-status-text">检测中...</span>';
+    statusEl.innerHTML = \`<span class="bili-status-icon">\${uiIcon('search')}</span><span class="bili-status-text">检测中...</span>\`;
 
     // 脱敏后的 *...* 无法直接校验，后端会自动改为校验“已保存”的 Cookie
     const isMasked = /^[*]+$/.test(cookie);
@@ -2217,20 +2974,20 @@ async function autoCheckBilibiliCookieStatus() {
 
                 // 用户手动输入/扫码填入的 Cookie → 提示保存
                 if (!isMasked) {
-                    statusEl.innerHTML = \`<span class="bili-status-icon">✅</span><span class="bili-status-text">\${uname}\${leftText} · 请点击保存按钮（Vercel等平台需重新部署后生效）</span>\`;
+                    statusEl.innerHTML = \`<span class="bili-status-icon">\${uiIcon('check-circle')}</span><span class="bili-status-text">\${uname}\${leftText} · 请点击保存按钮（Vercel等平台需重新部署后生效）</span>\`;
                 } else {
                     // 脱敏显示时只展示当前已保存 Cookie 的状态
-                    statusEl.innerHTML = \`<span class="bili-status-icon">✅</span><span class="bili-status-text">\${uname}\${leftText}</span>\`;
+                    statusEl.innerHTML = \`<span class="bili-status-icon">\${uiIcon('check-circle')}</span><span class="bili-status-text">\${uname}\${leftText}</span>\`;
                 }
             } else {
                 const err = result.data.error || 'Cookie无效或已失效';
-                statusEl.innerHTML = \`<span class="bili-status-icon">❌</span><span class="bili-status-text">\${err}，请重新扫码登录并保存</span>\`;
+                statusEl.innerHTML = \`<span class="bili-status-icon">\${uiIcon('x-circle')}</span><span class="bili-status-text">\${err}，请重新扫码登录并保存</span>\`;
             }
         } else {
-            statusEl.innerHTML = '<span class="bili-status-icon">⚠️</span><span class="bili-status-text">检测失败</span>';
+            statusEl.innerHTML = \`<span class="bili-status-icon">\${uiIcon('alert-triangle')}</span><span class="bili-status-text">检测失败</span>\`;
         }
     } catch (error) {
-        statusEl.innerHTML = '<span class="bili-status-icon">⚠️</span><span class="bili-status-text">检测失败</span>';
+        statusEl.innerHTML = \`<span class="bili-status-icon">\${uiIcon('alert-triangle')}</span><span class="bili-status-text">检测失败</span>\`;
     }
 }
 // 显示 Bilibili Cookie 保存提示
@@ -2239,7 +2996,23 @@ function showBilibiliCookieSaveHint(text) {
     if (!statusEl) return;
 
     const msg = text || '请点击保存按钮,Vercel等平台需重新部署后生效';
-    statusEl.innerHTML = \`<span class="bili-status-icon">💾</span><span class="bili-status-text">\${msg}</span>\`;
+    statusEl.innerHTML = \`<span class="bili-status-icon">\${uiIcon('save')}</span><span class="bili-status-text">\${msg}</span>\`;
+}
+
+/* ========================================
+   连通性测试取值
+   ======================================== */
+
+// 读取配置列表中某项的当前值，供连通性测试随请求提交；掩码（当前访问无权限读取明文）返回空串，由服务端回退到已保存配置
+function readLocalEnvValue(key) {
+    for (const items of Object.values(envVariables)) {
+        const item = items.find(entry => entry.key === key);
+        if (item && typeof item.value === 'string') {
+            const value = item.value.trim();
+            return /^[*]+$/.test(value) ? '' : value;
+        }
+    }
+    return '';
 }
 
 /* ========================================
@@ -2256,7 +3029,7 @@ async function verifyAiConnection() {
     
     // 如果输入框为空，提示未配置
     if (!apiKey) {
-        statusEl.innerHTML = '<span class="ai-status-icon">⚠️</span><span class="ai-status-text">请先输入 API Key</span>';
+        statusEl.innerHTML = \`<span class="ai-status-icon">\${uiIcon('alert-triangle')}</span><span class="ai-status-text">请先输入 API Key</span>\`;
         return;
     }
     
@@ -2265,29 +3038,34 @@ async function verifyAiConnection() {
     btn.innerHTML = '<span class="loading-spinner-small"></span>';
     btn.disabled = true;
     
-    statusEl.innerHTML = '<span class="ai-status-icon">🔍</span><span class="ai-status-text">正在测试连通性...</span>';
+    statusEl.innerHTML = \`<span class="ai-status-icon">\${uiIcon('search')}</span><span class="ai-status-text">正在测试连通性...</span>\`;
     
-    // 检查是否为脱敏后的 *...* 
+    // 地址与模型始终随请求提交，避免云部署下因未重新部署而取不到新配置；密钥为脱敏值时省略该字段，由服务端使用已保存的密钥
     const isMasked = /^[*]+$/.test(apiKey);
+    const payload = {
+        aiBaseUrl: readLocalEnvValue('AI_BASE_URL'),
+        aiModel: readLocalEnvValue('AI_MODEL')
+    };
+    if (!isMasked) payload.aiApiKey = apiKey;
     
     try {
         const response = await fetch(buildApiUrl('/api/ai/verify', true), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(isMasked ? {} : { 'aiApiKey': apiKey })
+            body: JSON.stringify(payload)
         });
         
         const result = await response.json();
         
         if (result.ok) {
-            statusEl.innerHTML = '<span class="ai-status-icon">✅</span><span class="ai-status-text">' + (result.message || 'AI 服务连通性测试成功') + '</span>';
+            statusEl.innerHTML = \`<span class="ai-status-icon">\${uiIcon('check-circle')}</span><span class="ai-status-text">\${result.message || 'AI 服务连通性测试成功'}</span>\`;
             statusEl.style.color = 'var(--success-color, #28a745)';
         } else {
-            statusEl.innerHTML = '<span class="ai-status-icon">❌</span><span class="ai-status-text">' + (result.message || '连通性测试失败') + '</span>';
+            statusEl.innerHTML = \`<span class="ai-status-icon">\${uiIcon('x-circle')}</span><span class="ai-status-text">\${result.message || '连通性测试失败'}</span>\`;
             statusEl.style.color = 'var(--danger-color, #dc3545)';
         }
     } catch (error) {
-        statusEl.innerHTML = '<span class="ai-status-icon">⚠️</span><span class="ai-status-text">测试请求失败: ' + error.message + '</span>';
+        statusEl.innerHTML = \`<span class="ai-status-icon">\${uiIcon('alert-triangle')}</span><span class="ai-status-text">测试请求失败: \${error.message}</span>\`;
         statusEl.style.color = 'var(--warning-color, #ffc107)';
     } finally {
         // 恢复按钮状态
@@ -2295,4 +3073,480 @@ async function verifyAiConnection() {
         btn.disabled = false;
     }
 }
+
+/* ========================================
+   弹弹play密码连通性测试功能
+   ======================================== */
+async function verifyDandanplayConnection() {
+    const statusEl = document.getElementById('dandanplay-status');
+    const btn = document.getElementById('dandanplay-verify-btn');
+    const passwordInput = document.getElementById('text-value');
+
+    if (!statusEl || !passwordInput) return;
+
+    const password = passwordInput.value.trim();
+
+    // 如果输入框为空，提示未配置
+    if (!password) {
+        statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('alert-triangle')}</span><span class="dandanplay-status-text">请先输入弹弹play密码</span>\`;
+        return;
+    }
+
+    // 设置按钮为加载状态
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '<span class="loading-spinner-small"></span>';
+    btn.disabled = true;
+
+    statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('search')}</span><span class="dandanplay-status-text">正在测试连通性...</span>\`;
+
+    // 账号始终随请求提交，避免云部署下因未重新部署而取不到新账号；密码为脱敏值时省略该字段，由服务端使用已保存的密码
+    const isMasked = /^[*]+$/.test(password);
+    const payload = { dandanplayAccount: readLocalEnvValue('DANDANPLAY_ACCOUNT') };
+    if (!isMasked) payload.dandanplayPassword = password;
+
+    try {
+        const response = await fetch(buildApiUrl('/api/nipaplay/verify', true), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+
+        if (result.ok) {
+            statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('check-circle')}</span><span class="dandanplay-status-text">\${result.message || '弹弹play账号连通性测试成功'}</span>\`;
+            statusEl.style.color = 'var(--success-color, #28a745)';
+        } else {
+            statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('x-circle')}</span><span class="dandanplay-status-text">\${result.message || '连通性测试失败'}</span>\`;
+            statusEl.style.color = 'var(--danger-color, #dc3545)';
+        }
+    } catch (error) {
+        statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('alert-triangle')}</span><span class="dandanplay-status-text">测试请求失败: \${error.message}</span>\`;
+        statusEl.style.color = 'var(--warning-color, #ffc107)';
+    } finally {
+        // 恢复按钮状态
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
+}
+
+/* ========================================
+   最近数据与animes缓存面板功能
+   ======================================== */
+
+// 统一切换卡片内的折叠区域
+function toggleCardSection(btnEl, targetSelector, openText, closeText) {
+    if (!btnEl) return;
+    const card = btnEl.closest('.anime-cache-card');
+    if (!card) return;
+    const container = card.querySelector(targetSelector);
+    if (!container) return;
+
+    const isHidden = window.getComputedStyle(container).display === 'none';
+    btnEl.querySelector('.cache-badge-label').textContent = isHidden ? closeText : openText;
+
+    if (isHidden) {
+        container.style.display = 'flex';
+        btnEl.classList.add('active');
+    } else {
+        container.style.display = 'none';
+        btnEl.classList.remove('active');
+    }
+}
+
+// 切换子节点内的映射详情
+function toggleMapping(btnEl) {
+    if (!btnEl) return;
+    const parentItem = btnEl.closest('.anime-cache-child-item');
+    if (!parentItem) return;
+    const container = parentItem.querySelector('.child-mapping-container');
+    if (!container) return;
+
+    const isHidden = window.getComputedStyle(container).display === 'none';
+    if (isHidden) {
+        container.style.display = 'flex';
+        btnEl.innerHTML = '<span class="ui-icon-label">' + uiIcon('list') + ' 收起映射详情</span>';
+        btnEl.classList.add('active');
+    } else {
+        container.style.display = 'none';
+        btnEl.innerHTML = '<span class="ui-icon-label">' + uiIcon('list') + ' 展开映射详情</span>';
+        btnEl.classList.remove('active');
+    }
+}
+
+// 最近数据分页状态
+const RECENT_DATA_PAGE_SIZE = 5;
+let recentAnimeCacheData = []; // 最近数据完整缓存
+let recentAnimeDisplayedCount = 0; // 最近数据已显示条数
+
+// 查看最近数据按钮：各配置页共用；className 用于与同行操作按钮保持同一尺寸
+function renderRecentDataButton(className = 'btn btn-primary btn-sm') {
+    return \`<button type="button" class="\${className}" onclick="fetchAndShowRecentData()">\${uiIcon('bar-chart')} 查看最近数据</button>\`;
+}
+
+// 查看最近数据折叠面板：hint 传入时作为面板内的提示文案
+function renderRecentDataPanel(hint) {
+    return \`
+        <div id="recent-data-panel" class="recent-data-panel">
+            \${hint ? \`<div class="form-help" style="margin: 0 0 8px 0;">\${hint}</div>\` : ''}
+            <div id="recent-data-list"></div>
+        </div>
+    \`;
+}
+
+// 快捷数据面板业务逻辑
+async function fetchAndShowRecentData() {
+    const panel = document.getElementById('recent-data-panel');
+    const listContainer = document.getElementById('recent-data-list');
+
+    if (!panel || !listContainer) return;
+
+    if (window.getComputedStyle(panel).display !== 'none') {
+        panel.style.display = 'none';
+        return;
+    }
+
+    panel.style.display = 'block';
+    listContainer.innerHTML = '<span class="loading-spinner-small"></span> 数据加载中...';
+
+    try {
+        const response = await fetch(buildApiUrl('/api/cache/animes', true));
+        const result = await response.json();
+
+        if (result.success && result.data && result.data.length > 0) {
+            recentAnimeCacheData = result.data;
+            recentAnimeDisplayedCount = 0;
+            renderAnimeCachePanel(result.data, listContainer);
+        } else {
+            listContainer.innerHTML = '<div class="text-gray font-size-12" style="padding: 10px 0;">缓存中暂无番剧数据，请先通过客户端请求弹幕接口以生成缓存。</div>';
+        }
+    } catch (error) {
+        listContainer.innerHTML = \`<div class="text-red font-size-12">请求失败: \${error.message}</div>\`;
+    }
+}
+
+// 渲染animes缓存面板 (含集数解析与映射详情)
+function renderAnimeCachePanel(data, listContainer) {
+    if (!listContainer || !editingKeyName) return;
+
+    const currentKey = editingKeyName;
+
+    // 内部辅助函数：生成操作按钮
+    const generateButtons = (title, source) => {
+        const safeTitle = escapeHtml(title);
+        const safeSource = escapeHtml(source);
+        if (currentKey === 'CUSTOM_MERGE_RULES') {
+            return \`
+                <div style="display:flex;flex-direction:column;gap:4px;">
+                    <button type="button" class="btn btn-sm btn-xs" data-fill-action="merge-sec" data-fill-title="\${safeTitle}" data-fill-source="\${safeSource}">设为副</button>
+                    <button type="button" class="btn btn-sm btn-primary btn-xs" data-fill-action="merge-prim" data-fill-title="\${safeTitle}" data-fill-source="\${safeSource}">设为主</button>
+                </div>
+            \`;
+        } else if (currentKey === 'DANMU_OFFSET') {
+            return \`
+                <button type="button" class="btn btn-sm btn-primary btn-xs" data-fill-action="offset" data-fill-title="\${safeTitle}" data-fill-source="\${safeSource}">填入</button>
+            \`;
+        }
+        return '';
+    };
+
+    // 内部辅助函数：清洗标题
+    const cleanTitleStr = (rawTitle) => rawTitle.replace(/\\s*from\\s+.*$/i, '').trim();
+
+    const nextCount = Math.min(recentAnimeDisplayedCount + RECENT_DATA_PAGE_SIZE, data.length);
+    const newItems = data.slice(recentAnimeDisplayedCount, nextCount);
+
+    let html = recentAnimeDisplayedCount === 0 ? '<div class="anime-cache-list">' : '';
+
+    newItems.forEach(item => {
+        const cleanTitle = cleanTitleStr(item.animeTitle);
+        const coverHtml = item.imageUrl ? \`<img class="anime-cache-cover" src="\${escapeHtml(item.imageUrl)}" alt="" referrerpolicy="no-referrer" loading="lazy">\` : '<div class="anime-cache-cover"></div>';
+
+        // 1. 构建合并子源模块
+        let childrenHtml = '';
+        let childrenCount = 0;
+        if (item.mergedChildren && item.mergedChildren.length > 0) {
+            childrenCount = item.mergedChildren.length;
+            const childItems = item.mergedChildren.map(child => {
+                const childCleanTitle = cleanTitleStr(child.animeTitle);
+
+                const childCoverHtml = child.imageUrl ? \`<img class="anime-cache-child-cover" src="\${escapeHtml(child.imageUrl)}" alt="" referrerpolicy="no-referrer" loading="lazy">\` : '<div class="anime-cache-child-cover"></div>';
+
+                // 解析映射数据并按匹配状态排序
+                let mappingHtml = '';
+                if (item.links && item.links.length > 0) {
+                    const parsedRows = [];
+
+                    item.links.forEach((link, idx) => {
+                        const urlStr = String(link.url || '');
+                        const hasMainMatch = urlStr.includes(item.source + ':') || !urlStr.includes(':');
+                        const hasChildMatch = urlStr.includes(child.source + ':');
+
+                        if (!hasMainMatch && !hasChildMatch) return;
+
+                        let mainSide = '(主源越界)';
+                        if (hasMainMatch) {
+                            const cleanMainEpTitle = escapeHtml((link.title || '未知剧集').replace(/^【.*?】\\s*/, ''));
+                            mainSide = \`【\${escapeHtml(item.source)}】\${cleanMainEpTitle}\`;
+                        }
+
+                        let childSide = '(副源缺失)';
+                        let childNum = NaN;
+
+                        if (hasChildMatch) {
+                            const regex = new RegExp(child.source + ':([^$]+)');
+                            const match = urlStr.match(regex);
+                            let childTitleStr = '(源ID未知)';
+
+                            if (match) {
+                                const childId = match[1];
+                                childTitleStr = \`(源ID: \${childId})\`;
+
+                                if (child.links && child.links.length > 0) {
+                                    const childLink = child.links.find(l => String(l.url) === String(childId));
+                                    if (childLink && childLink.title) {
+                                        childTitleStr = childLink.title.replace(/^【.*?】\\s*/, '');
+                                    }
+                                }
+                            } else {
+                                childTitleStr = (link.title || '').replace(/^【.*?】\\s*/, '');
+                            }
+                            childSide = \`【\${escapeHtml(child.source)}】\${escapeHtml(childTitleStr)}\`;
+                            
+                            const numMatch = childTitleStr.match(/\\d+/);
+                            if (numMatch) {
+                                childNum = parseInt(numMatch[0], 10);
+                            }
+                        }
+
+                        let rowHtml = '';
+                        if (hasMainMatch && hasChildMatch) {
+                            rowHtml = \`<div class="mapping-row"><span class="mapping-status success ui-icon-label">\${uiIcon('check')} 匹配</span> <span class="mapping-text">\${mainSide} ↔ \${childSide}</span></div>\`;
+                        } else {
+                            rowHtml = \`<div class="mapping-row"><span class="mapping-status warning ui-icon-label">\${uiIcon('x')} 落单</span> <span class="mapping-text">\${mainSide} ↔ \${childSide}</span></div>\`;
+                        }
+
+                        parsedRows.push({
+                            originalIndex: idx,
+                            hasChildMatch: hasChildMatch,
+                            childNum: childNum,
+                            html: rowHtml
+                        });
+                    });
+
+                    const matchedRows = parsedRows.filter(r => r.hasChildMatch).sort((a, b) => {
+                        if (!isNaN(a.childNum) && !isNaN(b.childNum)) {
+                            return a.childNum - b.childNum;
+                        }
+                        return a.originalIndex - b.originalIndex;
+                    });
+
+                    const lonelyRows = parsedRows.filter(r => !r.hasChildMatch).sort((a, b) => a.originalIndex - b.originalIndex);
+
+                    const finalRows = [...matchedRows, ...lonelyRows];
+                    const mappingRowsHtml = finalRows.map(r => r.html).join('');
+
+                    if (mappingRowsHtml) {
+                        mappingHtml = \`
+                            <div class="child-mapping-toggle" onclick="toggleMapping(this)"><span class="ui-icon-label">\${uiIcon('list')} 展开映射详情</span></div>
+                            <div class="child-mapping-container">
+                                \${mappingRowsHtml}
+                            </div>
+                        \`;
+                    }
+                }
+
+                return \`
+                    <div class="anime-cache-child-item">
+                        <div class="anime-cache-child-main">
+                            \${childCoverHtml}
+                            <div class="anime-cache-child-info">
+                                <div class="anime-cache-child-title" title="\${escapeHtml(child.animeTitle)}">\${escapeHtml(childCleanTitle)}</div>
+                                <div class="anime-cache-meta">[\${escapeHtml(child.source)}] (\${child.episodes}集)</div>
+                            </div>
+                            <div class="anime-cache-child-actions">
+                                \${generateButtons(childCleanTitle, child.source)}
+                            </div>
+                        </div>
+                        \${mappingHtml}
+                    </div>
+                \`;
+            }).join('');
+
+            childrenHtml = \`
+                <div class="merged-children-container">
+                    \${childItems}
+                </div>
+            \`;
+        }
+
+        // 2. 构建剧集参考列表模块
+        let episodesHtml = '';
+        let episodesCount = 0;
+        if (item.links && item.links.length > 0) {
+            episodesCount = item.links.length;
+            const epItems = item.links.map(link => {
+                const safeTitle = link.title ? escapeHtml(link.title) : '未知剧集';
+                return \`
+                    <div class="anime-cache-child-item" style="padding: 6px;">
+                        <div class="anime-cache-child-main">
+                            <div class="anime-cache-child-info">
+                                <div class="anime-cache-child-title" title="\${safeTitle}">\${safeTitle}</div>
+                            </div>
+                        </div>
+                    </div>
+                \`;
+            }).join('');
+
+            episodesHtml = \`
+                <div class="episodes-list-container">
+                    \${epItems}
+                </div>
+            \`;
+        }
+
+        // 3. 构建卡片底部专属切换栏 (Tab Bar)
+        let footerHtml = '';
+        if (childrenCount > 0 || episodesCount > 0) {
+            let badges = '';
+            if (episodesCount > 0) {
+                badges += \`<div class="cache-badge badge-episodes" onclick="toggleCardSection(this, '.episodes-list-container', '\${episodesCount} 个剧集', '收起剧集')">\${uiIcon('film')}<span class="cache-badge-label">\${episodesCount} 个剧集</span></div>\`;
+            }
+            if (childrenCount > 0) {
+                badges += \`<div class="cache-badge badge-sources" onclick="toggleCardSection(this, '.merged-children-container', '\${childrenCount} 个被合并源', '收起被合并源')">\${uiIcon('link')}<span class="cache-badge-label">\${childrenCount} 个被合并源</span></div>\`;
+            }
+            footerHtml = \`<div class="anime-cache-footer">\${badges}</div>\`;
+        }
+
+        // 4. 组装完整卡片
+        html += \`
+            <div class="anime-cache-card">
+                <div class="anime-cache-card-body">
+                    \${coverHtml}
+                    <div class="anime-cache-info">
+                        <div class="anime-cache-title" title="\${escapeHtml(item.animeTitle)}">\${escapeHtml(cleanTitle)}</div>
+                        <div class="anime-cache-meta">[\${escapeHtml(item.source)}] (\${item.episodes}集)</div>
+                    </div>
+                    <div class="anime-cache-actions">
+                        \${generateButtons(cleanTitle, item.source)}
+                    </div>
+                </div>
+                \${footerHtml}
+                \${childrenHtml}
+                \${episodesHtml}
+            </div>
+        \`;
+    });
+
+    if (recentAnimeDisplayedCount === 0) {
+        html += '</div>';
+        listContainer.innerHTML = html;
+    } else {
+        const listEl = listContainer.querySelector('.anime-cache-list');
+        if (listEl) listEl.insertAdjacentHTML('beforeend', html);
+    }
+
+    recentAnimeDisplayedCount = nextCount;
+    updateRecentDataLoadMore(listContainer, data.length, nextCount);
+}
+
+// 更新最近数据加载更多按钮
+function updateRecentDataLoadMore(listContainer, total, displayed) {
+    let loadMoreBtn = listContainer.querySelector('.recent-data-load-more');
+    if (displayed < total) {
+        if (!loadMoreBtn) {
+            loadMoreBtn = document.createElement('button');
+            loadMoreBtn.type = 'button';
+            loadMoreBtn.className = 'btn btn-primary btn-sm recent-data-load-more';
+            loadMoreBtn.onclick = loadMoreRecentData;
+            listContainer.appendChild(loadMoreBtn);
+        }
+        loadMoreBtn.textContent = '加载更多 (' + displayed + '/' + total + ')';
+    } else if (loadMoreBtn) {
+        loadMoreBtn.remove();
+    }
+}
+
+// 加载更多最近数据
+function loadMoreRecentData() {
+    const listContainer = document.getElementById('recent-data-list');
+    if (!listContainer) return;
+    renderAnimeCachePanel(recentAnimeCacheData, listContainer);
+}
+
+/* ========================================
+   表单填充快捷操作功能
+   ======================================== */
+
+// 内部辅助函数：输入框视觉反馈统一处理
+function applyInputFeedback(inputEl) {
+    if (!inputEl) return;
+    const oldBorder = inputEl.style.borderColor;
+    inputEl.style.borderColor = '#28a745';
+    setTimeout(() => inputEl.style.borderColor = oldBorder, 800);
+}
+
+// 表单填充逻辑：合并映射表
+function fillMergeEntity(type, title, source) {
+    const panel = document.getElementById('merge-rule-panel');
+    if (panel && window.getComputedStyle(panel).display === 'none') {
+        toggleMergeRulePanel();
+    }
+
+    const inputId = type === 'sec' ? 'merge-sec-entity' : 'merge-prim-entity';
+    const inputEl = document.getElementById(inputId);
+
+    if (inputEl) {
+        inputEl.value = \`\${title}@\${source}\`;
+        applyInputFeedback(inputEl);
+        setMergeFocus(type);
+    }
+}
+
+// 表单填充逻辑：弹幕偏移
+function fillOffsetEntity(title, source) {
+    const panel = document.getElementById('offset-rule-panel');
+    if (panel && window.getComputedStyle(panel).display === 'none') {
+        toggleOffsetRulePanel();
+    }
+
+    // 视图层数据清洗：去除年份和类型后缀
+    const cleanTitle = title
+        .replace(/[\\u200B-\\u200F\\uFEFF]/g, '')
+        .replace(/\\s*[（(〔\\[]\\s*[0-9０-９]{4}\\s*年?\\s*[）)〕\\]]/g, '') 
+        .replace(/(.+?)\\s*【[^】]+】$/, '$1')
+        .trim();
+
+    const inputEl = document.getElementById('offset-anime');
+
+    if (inputEl) {
+        inputEl.value = cleanTitle;
+
+        // 基于 data-value 属性匹配并选中对应来源标签
+        const sourceTags = document.querySelectorAll('#offset-sources .offset-source-tag');
+        if (sourceTags.length > 0) {
+            sourceTags.forEach(el => el.classList.remove('selected'));
+            const targetTag = Array.from(sourceTags).find(el => el.dataset.value === source);
+            if (targetTag) targetTag.classList.add('selected');
+        }
+
+        applyInputFeedback(inputEl);
+    }
+}
+
+// 处理最近数据面板快捷填入按钮的点击
+document.addEventListener('click', function(e) {
+    const btn = e.target.closest('[data-fill-action]');
+    if (!btn) return;
+    const action = btn.dataset.fillAction;
+    const title = btn.dataset.fillTitle;
+    const source = btn.dataset.fillSource;
+    if (action === 'offset') {
+        fillOffsetEntity(title, source);
+    } else if (action === 'merge-sec') {
+        fillMergeEntity('sec', title, source);
+    } else if (action === 'merge-prim') {
+        fillMergeEntity('prim', title, source);
+    }
+});
 `;
